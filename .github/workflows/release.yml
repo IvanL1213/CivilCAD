@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libvulkan1
+      - name: Build release binary
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          rustup target add "$RUST_TARGET"
+          cargo build --locked --release --target "$RUST_TARGET"
+      - name: Package Linux binary
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          tar -czf dist/CivilCAD-linux-x86_64.tar.gz \
+            -C "target/$RUST_TARGET/release" civilcad -C "$GITHUB_WORKSPACE" LICENSE
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[0].version')
+          bundle=dist/CivilCAD.app
+          mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+          cp "target/$RUST_TARGET/release/civilcad" "$bundle/Contents/MacOS/"
+          cp LICENSE "$bundle/Contents/Resources/"
+          cp packaging/macos/Info.plist "$bundle/Contents/"
+          bundle_version="${version%%[-+]*}"
+          plutil -insert CFBundleShortVersionString -string "$bundle_version" "$bundle/Contents/Info.plist"
+          plutil -insert CFBundleVersion -string "$bundle_version" "$bundle/Contents/Info.plist"
+          plutil -lint "$bundle/Contents/Info.plist"
+          codesign --force --sign - "$bundle"
+          codesign --verify --strict "$bundle"
+          ditto -c -k --keepParent "$bundle" dist/CivilCAD-macos-arm64.zip
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist
+          $binary = "target/$env:RUST_TARGET/release/civilcad.exe"
+          Compress-Archive -Path $binary, LICENSE -DestinationPath dist/CivilCAD-windows-x86_64.zip
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CivilCAD-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  draft-release:
+    name: Create draft release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: CivilCAD-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[0].version')
+          gh release create "v$version" --draft --target "$GITHUB_SHA" \
+            --title "CivilCAD $version" --generate-notes \
+            dist/CivilCAD-linux-x86_64.tar.gz \
+            dist/CivilCAD-macos-arm64.zip \
+            dist/CivilCAD-windows-x86_64.zip
