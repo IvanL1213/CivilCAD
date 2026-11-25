@@ -107,7 +107,10 @@ impl Render for Viewport {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let camera = self.camera;
         let bounds = self.bounds.clone();
-        let coordinates = self.cursor.map_or_else(
+        let entity_id = cx.entity_id();
+        let track_coordinates = self.cursor.is_some();
+        let cursor = self.cursor.filter(|cursor| bounds.get().contains(cursor));
+        let coordinates = cursor.map_or_else(
             || "X        —   Y        —".to_owned(),
             |cursor| {
                 let position = (cursor - camera.origin(bounds.get())) * (1.0 / camera.scale);
@@ -189,7 +192,12 @@ impl Render for Viewport {
             }))
             .child(
                 canvas(
-                    move |area, _, _| bounds.set(area),
+                    move |area, window, _| {
+                        if bounds.replace(area) != area && track_coordinates {
+                            // Refresh the readout after layout moves the drawing under the pointer.
+                            window.on_next_frame(move |_, cx| cx.notify(entity_id));
+                        }
+                    },
                     move |area, (), window, _| {
                         paint_grid(window, area, camera);
                     },
